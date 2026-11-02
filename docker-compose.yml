@@ -1,0 +1,32 @@
+services:
+  friday:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      FRIDAY_HOST: 0.0.0.0
+      FRIDAY_PORT: 8000
+      FRIDAY_API_TOKEN: ${FRIDAY_API_TOKEN:?Set FRIDAY_API_TOKEN in your environment}
+      FRIDAY_GEMINI_API_KEY: ${FRIDAY_GEMINI_API_KEY:?Set FRIDAY_GEMINI_API_KEY in your environment}
+      FRIDAY_GEMINI_MODEL: ${FRIDAY_GEMINI_MODEL:-gemini-3.5-flash-lite}
+      FRIDAY_GEMINI_TTS_MODEL: ${FRIDAY_GEMINI_TTS_MODEL:-gemini-3.8-flash-lite-tts}
+      FRIDAY_MEMORY_PATH: /var/lib/friday/memory/long_term.json
+      FRIDAY_STAGING_DIR: /var/lib/friday/staging_tools
+      FRIDAY_MEMORY_PROVIDER_ACCESS: ${FRIDAY_MEMORY_PROVIDER_ACCESS:-false}
+      FRIDAY_TELEGRAM_BOT_TOKEN: ${FRIDAY_TELEGRAM_BOT_TOKEN:-}
+      FRIDAY_TELEGRAM_ALLOWED_USER_IDS: ${FRIDAY_TELEGRAM_ALLOWED_USER_IDS:-}
+      TELEGRAM_ALERT_CHAT_IDS: ${TELEGRAM_ALERT_CHAT_IDS:-}
+      FRIDAY_MQTT_HOST: ${FRIDAY_MQTT_HOST:-}
+      FRIDAY_MQTT_PORT: ${FRIDAY_MQTT_PORT:-8883}
+      FRIDAY_MQTT_USERNAME: ${FRIDAY_MQTT_USERNAME:-}
+      FRIDAY_MQTT_PASSWORD: ${FRIDAY_MQTT_PASSWORD:-}
+      FRIDAY_MQTT_TOPIC: ${FRIDAY_MQTT_TOPIC:-}
+    volumes:
+      - friday-data:/var/lib/friday
+      - ./config:/app/config:ro
+
+volumes:
+  friday-data:

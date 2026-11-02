@@ -1,0 +1,85 @@
+# Headless service dependencies; excludes PyQt, desktop audio and GUI automation.
+#fastapi>=0.110,<1
+#uvicorn[standard]>=0.27,<1
+#static-ffmpeg>=3.0,<4
+#python-multipart>=0.0.9,<1
+#google-genai>=2.8.0,<3
+#httpx[http2]>=0.27,<1
+#numpy>=1.24,<3
+#requests>=2.31,<3
+#beautifulsoup4>=4.12,<5
+#psutil>=5.9,<8
+#paho-mqtt>=2,<3
+#python-telegram-bot>=21,<23
+#youtube-transcript-api>=1.0,<2
+#google-api-python-client>=2,<3
+#google-auth-oauthlib>=1,<2
+#tinytuya>=1,<2
+#edge-tts>=6.1,<8
+#cryptography>=42,<50
+#pillow>=10,<13
+#pdfplumber>=0.11,<1
+#PyPDF2>=3,<4
+#python-docx>=1,<2
+#python-pptx>=0.6.23,<2
+#openpyxl>=3.1,<4
+#qrcode[pil]>=7,<9
+#twilio>=9,<10 
+
+# ==========================================================
+# F.R.I.D.A.Y. Cloud-Native Headless Service Dependencies
+# (Excludes PyQt, desktop GUI, and hardware-only audio drivers)
+# ==========================================================
+
+# Core Web Framework & Server
+fastapi>=0.110,<1
+uvicorn[standard]>=0.27,<1
+python-multipart>=0.0.9,<1
+python-dotenv>=1.0,<2
+aiofiles>=23,<25
+
+# Audio Engine & Cloud FFmpeg Injection
+static-ffmpeg>=3.0,<4
+edge-tts>=6.1,<8
+soundfile>=0.12,<1
+
+# AI, LLM & Client Connections
+google-genai>=2.8.0,<3
+httpx[http2]>=0.27,<1
+requests>=2.31,<3
+
+# Search, Web Scraping & Media
+duckduckgo-search>=6.0,<8
+beautifulsoup4>=4.12,<5
+youtube-transcript-api>=1.0,<2
+
+# Mathematics, Simulations & Robotics
+numpy>=1.24,<3
+scipy>=1.11,<2
+opencv-python-headless>=4.8,<5
+
+# Telegram Bot Interface
+python-telegram-bot>=21,<23
+
+# IoT, Smart Home & Cloud Communications
+paho-mqtt>=2,<3
+tinytuya>=1,<2
+twilio>=9,<10
+
+# Security, Cryptography & Hardware Telemetry
+cryptography>=42,<50
+psutil>=5.9,<8
+
+# Google OAuth Integrations (Gmail, Calendar)
+google-api-python-client>=2,<3
+google-auth-oauthlib>=1,<2
+
+# Universal File Processing (Office, PDF, Images)
+pillow>=10,<13
+pdfplumber>=0.11,<1
+PyPDF2>=3,<4
+python-docx>=1,<2
+python-pptx>=0.6.23,<2
+openpyxl>=3.1,<4
+pandas>=2.0,<3
+qrcode[pil]>=7,<9
