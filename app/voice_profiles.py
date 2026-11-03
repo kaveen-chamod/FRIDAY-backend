@@ -25,7 +25,7 @@ _LOG = logging.getLogger("friday.voice")
 _PROFILE_FILE = Path(
     os.environ.get("FRIDAY_CONFIG_DIR")
     or Path(__file__).resolve().parents[1] / "config"
-).expanduser() / "family_voice.dat"
+).expanduser().resolve() / "family_voice.dat"
 _SAMPLE_RATE = 16_000
 _MIN_SAMPLES = 2
 _MAX_SAMPLES = 8

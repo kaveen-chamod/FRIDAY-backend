@@ -83,8 +83,10 @@ class DigitalTwinEngine:
             raise ValueError("telemetry_max_age_seconds must be between 1 and 3600.")
         state_root = Path(
             os.environ.get("FRIDAY_STATE_DIR") or _PROJECT_ROOT / "memory"
-        ).expanduser()
-        self.state_path = Path(state_path or state_root / "digital_twins.json")
+        ).expanduser().resolve()
+        self.state_path = Path(
+            state_path or state_root / "digital_twins.json"
+        ).expanduser().resolve(strict=False)
         self.predictive_service = predictive_service
         self.telemetry_max_age_seconds = float(telemetry_max_age_seconds)
         self._lock = threading.RLock()

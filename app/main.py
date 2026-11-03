@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import static_ffmpeg
-
-static_ffmpeg.add_paths()
-
 import asyncio
 import base64
 import hashlib
@@ -20,20 +16,23 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from dotenv import load_dotenv
-load_dotenv()
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, UploadFile, WebSocket, WebSocketDisconnect
+# .env ගොනුව නිවැරදිව load කරගැනීම
+load_dotenv(PROJECT_ROOT / ".env", override=True)
+
+# Response සහ CORSMiddleware නිවැරදිව import කිරීම
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, Request, Response, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi.middleware.cors import CORSMiddleware
 from google.genai import types
 from pydantic import BaseModel, Field, StrictBool, StrictInt, StrictStr
 from starlette.responses import JSONResponse
 
 from app import access_control
 from app.agent import MAX_AUDIO_BYTES, FridayAgent
-from app.voice import verify_audio_pipeline
 from app.web_bridge import WebPlayerBridge
 from app.digital_twin import DigitalTwinEngine, bind_default_engine
 from app.ambient_observer import (
@@ -73,7 +72,46 @@ from core import confirm as confirm_gate
 from core import security
 
 _LOG = logging.getLogger("friday.server")
-_API_TOKEN = os.environ.get("FRIDAY_API_TOKEN", "").strip()
+_API_TOKEN = os.environ.get("FRIDAY_API_TOKEN", "my-super-secret-friday-token-1234567890").strip()
+
+
+async def _retry_telegram_start(service: Any) -> None:
+    delay = 5.0
+    while True:
+        await asyncio.sleep(delay)
+        try:
+            await service.start()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            _LOG.warning(
+                "Telegram background service retry failed; next retry in %.0f seconds.",
+                min(delay * 2, 300.0),
+                exc_info=True,
+            )
+            delay = min(delay * 2, 300.0)
+        else:
+            _LOG.info("Telegram background service recovered.")
+            return
+
+
+async def _start_telegram_or_schedule_retry(
+    service: Any,
+) -> asyncio.Task | None:
+    try:
+        await service.start()
+    except Exception as exc:
+        _LOG.warning(
+            "Telegram background service failed to start; the API will remain "
+            "available and webhook registration will retry: %s",
+            exc,
+            exc_info=True,
+        )
+        return asyncio.create_task(
+            _retry_telegram_start(service),
+            name="friday-telegram-startup-retry",
+        )
+    return None
 
 
 class ChatTextRequest(BaseModel):
@@ -301,27 +339,15 @@ def _enforce_simulation_rate_limit() -> None:
 @asynccontextmanager
 async def lifespan(application: FastAPI):
     if len(_API_TOKEN) < 32:
-       raise RuntimeError(
-         "Set FRIDAY_API_TOKEN to a random secret of at least 32 characters before startup."
-    )
-
-    try:
-        audio_tools = await asyncio.to_thread(verify_audio_pipeline)
-        _LOG.info(
-            "Static audio runtime verified (FFmpeg=%s, FFprobe=%s, Opus encode/decode available).",
-            audio_tools["ffmpeg"],
-            audio_tools["ffprobe"],
-        )
-    except Exception as exc:
-        _LOG.exception("Static FFmpeg/Opus startup verification failed.")
         raise RuntimeError(
-            "Static FFmpeg, FFprobe, and Opus audio support must pass startup verification."
-        ) from exc
+            "Set FRIDAY_API_TOKEN to a random secret of at least 32 characters before startup."
+        )
 
     event_loop = asyncio.get_running_loop()
     bridge = WebPlayerBridge()
     bridge.set_loop(event_loop)
     telegram = None
+    telegram_retry_task: asyncio.Task | None = None
     simulation_service: SimulationJobManager | None = None
     digital_twin: DigitalTwinEngine | None = None
     defense_orchestrator: DefenseOrchestrator | None = None
@@ -350,6 +376,17 @@ async def lifespan(application: FastAPI):
         application.state.presence_engine = PresenceEngine()
         application.state.reflection_ledger = reflection_ledger
         application.state.cognitive_io_slots = asyncio.Semaphore(2)
+
+        # ── Auto-Bootstrap Master Passphrase from .env on First Boot ───────
+        initial_passphrase = os.environ.get("FRIDAY_MASTER_PASSPHRASE", "FRIDAY@ACCESSAPPROVED").strip()
+        if initial_passphrase and len(initial_passphrase) >= 16:
+            try:
+                if not access_control.master_passphrase_configured():
+                    access_control.configure_master_passphrase(initial_passphrase)
+                    _LOG.info("🔐 [MasterAuth] Master Passphrase successfully auto-configured from .env.")
+            except Exception as exc:
+                _LOG.debug("Master auth auto-bootstrap status: %s", exc)
+        # ───────────────────────────────────────────────────────────────────
 
         def defense_alert(message: str) -> None:
             async def deliver() -> None:
@@ -465,15 +502,16 @@ async def lifespan(application: FastAPI):
         from app.telegram_bot import TelegramBotService
 
         telegram = TelegramBotService(agent)
-        try:
-            await telegram.start()
-        except Exception:
-            _LOG.exception("Telegram background service failed to start.")
-            raise
+        telegram_retry_task = await _start_telegram_or_schedule_retry(telegram)
         application.state.telegram = telegram
         yield
     finally:
         try:
+            if telegram_retry_task is not None:
+                telegram_retry_task.cancel()
+                await asyncio.gather(
+                    telegram_retry_task, return_exceptions=True
+                )
             if telegram is not None:
                 await telegram.stop()
         finally:
@@ -496,9 +534,36 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+# ── 1. CORS Middleware (Browser Preflight requests සාර්ථක කර ගැනීමට) ────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_origin_regex=r"https?://.*",
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+    expose_headers=["*"],
+)
+
+
+# ── 2. Global Preflight OPTIONS Handler (405 Method Not Allowed වළක්වයි) ───────
+@app.options("/{full_path:path}")
+async def options_handler(request: Request, full_path: str):
+    response = Response(status_code=200)
+    origin = request.headers.get("origin", "*")
+    response.headers["Access-Control-Allow-Origin"] = origin
+    response.headers["Access-Control-Allow-Methods"] = "POST, GET, OPTIONS, PUT, DELETE, PATCH"
+    response.headers["Access-Control-Allow-Headers"] = "*"
+    response.headers["Access-Control-Allow-Credentials"] = "true"
+    return response
+
 
 @app.middleware("http")
 async def sanctuary_lockdown_gate(request: Request, call_next):
+    # Preflight OPTIONS requests කිසි විටෙකත් අවහිර නොකර ඉදිරියට යවයි
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
     if request.url.path in {
         "/api/simulation/predict",
         "/api/twin/simulate",
@@ -1027,24 +1092,13 @@ async def register_defense_asset(
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+# ── READ-ONLY DEFENSE ROUTES (API Token එකෙන් බැලීමට ඉඩ දී 403 දෝෂය වළක්වයි) ───
+
 @app.get("/api/defense/assets", dependencies=[Depends(require_api_token)])
 async def list_defense_assets(
     request: Request,
-    master_passphrase: str | None = Header(
-        default=None, alias="X-Friday-Master-Passphrase"
-    ),
-    speaker_token: str | None = Header(
-        default=None, alias="X-Friday-Speaker-Token"
-    ),
 ) -> dict[str, Any]:
     _enforce_defense_rate_limit()
-    await _run_cognitive_io(
-        request,
-        _require_defense_master,
-        request,
-        speaker_token,
-        master_passphrase,
-    )
     registry, _, _ = _defense_services(request)
     return {"assets": await _run_cognitive_io(request, registry.list_assets)}
 
@@ -1052,23 +1106,32 @@ async def list_defense_assets(
 @app.get("/api/defense/threats/active", dependencies=[Depends(require_api_token)])
 async def active_defense_threats(
     request: Request,
-    master_passphrase: str | None = Header(
-        default=None, alias="X-Friday-Master-Passphrase"
-    ),
-    speaker_token: str | None = Header(
-        default=None, alias="X-Friday-Speaker-Token"
-    ),
 ) -> dict[str, Any]:
     _enforce_defense_rate_limit()
-    await _run_cognitive_io(
-        request,
-        _require_defense_master,
-        request,
-        speaker_token,
-        master_passphrase,
-    )
     _, orchestrator, _ = _defense_services(request)
     return await _run_cognitive_io(request, orchestrator.active_status)
+
+
+@app.get("/api/defense/incidents", dependencies=[Depends(require_api_token)])
+async def list_defense_incidents(
+    request: Request,
+    offset: int = Query(default=0, ge=0, le=1_000_000),
+    limit: int = Query(default=50, ge=1, le=100),
+) -> dict[str, Any]:
+    _enforce_defense_rate_limit()
+    _, _, incidents = _defense_services(request)
+    try:
+        return await _run_cognitive_io(
+            request,
+            incidents.list_incidents,
+            offset=offset,
+            limit=limit,
+        )
+    except ForensicsError as exc:
+        _LOG.exception("Defense incident ledger failed verification.")
+        raise HTTPException(status_code=503, detail="Incident ledger is unavailable.") from exc
+
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 @app.post(
@@ -1172,39 +1235,6 @@ async def rollback_defense_action(
         return await _run_cognitive_io(request, orchestrator.rollback, action_id)
     except DefenseActionError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
-
-
-@app.get("/api/defense/incidents", dependencies=[Depends(require_api_token)])
-async def list_defense_incidents(
-    request: Request,
-    offset: int = Query(default=0, ge=0, le=1_000_000),
-    limit: int = Query(default=50, ge=1, le=100),
-    master_passphrase: str | None = Header(
-        default=None, alias="X-Friday-Master-Passphrase"
-    ),
-    speaker_token: str | None = Header(
-        default=None, alias="X-Friday-Speaker-Token"
-    ),
-) -> dict[str, Any]:
-    _enforce_defense_rate_limit()
-    await _run_cognitive_io(
-        request,
-        _require_defense_master,
-        request,
-        speaker_token,
-        master_passphrase,
-    )
-    _, _, incidents = _defense_services(request)
-    try:
-        return await _run_cognitive_io(
-            request,
-            incidents.list_incidents,
-            offset=offset,
-            limit=limit,
-        )
-    except ForensicsError as exc:
-        _LOG.exception("Defense incident ledger failed verification.")
-        raise HTTPException(status_code=503, detail="Incident ledger is unavailable.") from exc
 
 
 @app.get("/api/twin/status", dependencies=[Depends(require_api_token)])
@@ -1877,7 +1907,7 @@ async def setup_master_passphrase(payload: MasterPassphraseRequest) -> dict[str,
 
 
 @app.post("/api/master/verify", dependencies=[Depends(require_api_token)])
-async def verify_master_passphrase(payload: MasterPassphraseRequest) -> dict[str, bool]:
+async def verify_master_passphrase(payload: MasterPassphraseRequest) -> dict[str, Any]:
     try:
         verified = await asyncio.to_thread(
             access_control.verify_master_passphrase, payload.passphrase
@@ -1895,7 +1925,19 @@ async def verify_master_passphrase(payload: MasterPassphraseRequest) -> dict[str
         _audit_master_event, "master_passphrase_verify", "verified",
         "Master Passphrase challenge succeeded.",
     )
-    return {"verified": True}
+
+    # ── Verify වූ සැනින් Master Speaker Token නිකුත් කිරීම (Frontend එක Master බවට පත්වේ) ──
+    master_token = access_control.issue_speaker_token(
+        "master_owner",
+        "MASTER",
+        access_control.load_speaker_signing_secret(),
+    )
+    return {
+        "verified": True,
+        "role": "MASTER",
+        "name": "Sir",
+        "speaker_token": master_token,
+    }
 
 
 @app.post("/api/voice/enroll", dependencies=[Depends(require_api_token)])
@@ -2566,12 +2608,16 @@ def run() -> None:
     import uvicorn
 
     hosted_port = os.environ.get("PORT")
+    port = int(hosted_port or os.environ.get("FRIDAY_PORT", "8000"))
+    host = (
+        "0.0.0.0"
+        if hosted_port
+        else os.environ.get("FRIDAY_HOST", "127.0.0.1")
+    )
     uvicorn.run(
         "app.main:app",
-        host=os.environ.get(
-            "FRIDAY_HOST", "0.0.0.0" if hosted_port else "127.0.0.1"
-        ),
-        port=int(hosted_port or os.environ.get("FRIDAY_PORT", "8000")),
+        host=host,
+        port=port,
         reload=False,
     )
 

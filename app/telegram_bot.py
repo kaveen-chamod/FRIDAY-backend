@@ -329,14 +329,25 @@ class TelegramBotService:
             self._application_initialized = True
 
             if mode == "webhook":
-                webhook_set = await application.bot.set_webhook(
-                    url=webhook_url,
-                    secret_token=webhook_secret,
-                    allowed_updates=["message"],
-                    drop_pending_updates=False,
-                )
-                if webhook_set is False:
-                    raise RuntimeError("Telegram rejected the webhook registration.")
+                try:
+                    webhook_set = await application.bot.set_webhook(
+                        url=webhook_url,
+                        secret_token=webhook_secret,
+                        allowed_updates=["message"],
+                        drop_pending_updates=False,
+                    )
+                    if webhook_set is False:
+                        raise RuntimeError(
+                            "Telegram rejected the webhook registration."
+                        )
+                except Exception as exc:
+                    _LOG.warning(
+                        "Telegram webhook registration failed; service startup "
+                        "will be retried: %s",
+                        exc,
+                        exc_info=True,
+                    )
+                    raise
             else:
                 if application.updater is None:
                     raise RuntimeError(

@@ -21,7 +21,7 @@ def get_base_dir() -> Path:
 BASE_DIR         = get_base_dir()
 MEMORY_PATH      = Path(
     os.environ.get("FRIDAY_MEMORY_PATH", BASE_DIR / "memory" / "long_term.json")
-).expanduser()
+).expanduser().resolve(strict=False)
 _lock            = Lock()
 MAX_VALUE_LENGTH = 380
 

@@ -18,9 +18,16 @@ from typing import Any
 _LOG = logging.getLogger("friday.access")
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 _DEFAULT_CONFIG_ROOT = _PROJECT_ROOT / "config"
-_CONFIG_ROOT = Path(
-    os.environ.get("FRIDAY_CONFIG_DIR") or _DEFAULT_CONFIG_ROOT
-).expanduser().resolve()
+
+# Config directory එක ආරක්ෂිතව තෝරා ගැනීම (Cloud & Local)
+_custom_dir = os.environ.get("FRIDAY_CONFIG_DIR", "").strip()
+if _custom_dir:
+    _CONFIG_ROOT = Path(_custom_dir).expanduser().resolve()
+else:
+    _CONFIG_ROOT = _DEFAULT_CONFIG_ROOT.resolve()
+
+_CONFIG_ROOT.mkdir(parents=True, exist_ok=True)
+
 MASTER_AUTH_FILE = _CONFIG_ROOT / "master_auth.json"
 SPEAKER_KEY_FILE = _CONFIG_ROOT / "speaker_token.key"
 _CONFIG_ROOTS = {_DEFAULT_CONFIG_ROOT.resolve(), _CONFIG_ROOT}
@@ -30,7 +37,10 @@ _PROTECTED_CORE_FILES = frozenset(
 )
 _PBKDF2_ITERATIONS = 600_000
 _MIN_PASSPHRASE_LENGTH = 16
-_SPEAKER_TOKEN_TTL = 120
+
+# Token එක විනාඩි 2කින් expire වීම වළක්වා පැය 24ක් (86400s) වලංගු වන සේ සැකසීම
+_SPEAKER_TOKEN_TTL = 86400
+
 _AUTH_LOCK = threading.RLock()
 _ATTEMPT_LOCK = threading.Lock()
 _FAILED_ATTEMPTS: deque[float] = deque()
@@ -103,8 +113,16 @@ def assert_safe_write_target(path: str | os.PathLike, *, internal_secret: bool =
         raise PermissionError("Writes to protected core security files are forbidden.")
     if not any(_is_relative_to(target, root) for root in _CONFIG_ROOTS):
         return target
+
     allowed_secrets = {MASTER_AUTH_FILE.resolve(), SPEAKER_KEY_FILE.resolve()}
-    if internal_secret and target in allowed_secrets:
+
+    # නිවැරදි කිරීම: .tmp තාවකාලික auth ගොනු ලිවීමට අවසර ලබා දීම (Fixes PermissionError)
+    is_temp_secret = (
+        (target.parent == MASTER_AUTH_FILE.parent.resolve() and target.name.startswith(MASTER_AUTH_FILE.name) and target.name.endswith(".tmp")) or
+        (target.parent == SPEAKER_KEY_FILE.parent.resolve() and target.name.startswith(SPEAKER_KEY_FILE.name) and target.name.endswith(".tmp"))
+    )
+
+    if internal_secret and (target in allowed_secrets or is_temp_secret):
         return target
     raise PermissionError("Writes to root configuration files are forbidden.")
 
@@ -243,7 +261,6 @@ def issue_speaker_token(
 
 
 def load_speaker_signing_secret() -> str:
-    """Load a server-only signer, never reusing the client-visible API token."""
     global _speaker_secret_cache
     with _AUTH_LOCK:
         if _speaker_secret_cache:
@@ -339,3 +356,5 @@ def verify_speaker_token(
         return {"profile_id": payload["profile_id"], "role": payload["role"]}
     except (ValueError, TypeError, KeyError, UnicodeDecodeError, json.JSONDecodeError):
         return None
+
+

@@ -34,8 +34,15 @@ class AssetRegistryError(ValueError):
 
 class AuthorizedAssetRegistry:
     def __init__(self, path: str | Path | None = None) -> None:
-        root = Path(os.environ.get("FRIDAY_STATE_DIR") or Path(__file__).resolve().parents[2] / "memory")
-        self.path = Path(path) if path is not None else root / "authorized_assets.json"
+        root = Path(
+            os.environ.get("FRIDAY_STATE_DIR")
+            or Path(__file__).resolve().parents[2] / "memory"
+        ).expanduser().resolve()
+        self.path = (
+            Path(path).expanduser().resolve(strict=False)
+            if path is not None
+            else root / "authorized_assets.json"
+        )
         self._lock = threading.RLock()
         self._assets = self._load()
 

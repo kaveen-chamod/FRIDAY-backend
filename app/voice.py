@@ -2,28 +2,21 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import os
 import re
+import shutil
 import subprocess
 import tempfile
+import threading
 import wave
 
-import static_ffmpeg
-from static_ffmpeg.run import get_or_fetch_platform_executables_else_raise
 
+_LOG = logging.getLogger("friday.voice")
+_AUDIO_TOOL_LOCK = threading.Lock()
+_AUDIO_TOOL_PATHS: tuple[str, str] | None = None
+_STATIC_FFMPEG_PROVISION_FAILED = False
 
-static_ffmpeg.add_paths()
-_STATIC_FFMPEG, _STATIC_FFPROBE = (
-    get_or_fetch_platform_executables_else_raise()
-)
-_STATIC_FFMPEG_DIR = os.path.dirname(_STATIC_FFMPEG)
-_PATH_ENTRIES = os.environ.get("PATH", "").split(os.pathsep)
-if not _PATH_ENTRIES or os.path.normcase(os.path.abspath(_PATH_ENTRIES[0])) != os.path.normcase(
-    os.path.abspath(_STATIC_FFMPEG_DIR)
-):
-    os.environ["PATH"] = os.pathsep.join(
-        [_STATIC_FFMPEG_DIR, os.environ.get("PATH", "")]
-    )
 
 _MAX_AUDIO_BYTES = 25 * 1024 * 1024
 _MAX_DECODE_SECONDS = 120
@@ -31,28 +24,86 @@ _FFMPEG_TIMEOUT_SECONDS = 45
 _MAX_PCM_WAV_BYTES = 16000 * 2 * _MAX_DECODE_SECONDS + 65536
 
 
-def ffmpeg_executable() -> str:
-    if not os.path.isfile(_STATIC_FFMPEG):
+def _resolve_audio_tool_paths() -> tuple[str, str]:
+    global _AUDIO_TOOL_PATHS, _STATIC_FFMPEG_PROVISION_FAILED
+    with _AUDIO_TOOL_LOCK:
+        if _AUDIO_TOOL_PATHS is not None and all(
+            os.path.isfile(path) for path in _AUDIO_TOOL_PATHS
+        ):
+            return _AUDIO_TOOL_PATHS
+
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if ffmpeg and not ffprobe:
+            suffix = ".exe" if os.name == "nt" else ""
+            sibling = os.path.join(os.path.dirname(ffmpeg), f"ffprobe{suffix}")
+            if os.path.isfile(sibling):
+                ffprobe = sibling
+        if ffmpeg and ffprobe:
+            _AUDIO_TOOL_PATHS = (ffmpeg, ffprobe)
+            return _AUDIO_TOOL_PATHS
+
+        if not ffmpeg and not _STATIC_FFMPEG_PROVISION_FAILED:
+            try:
+                import static_ffmpeg
+                from static_ffmpeg.run import (
+                    get_or_fetch_platform_executables_else_raise,
+                )
+
+                static_ffmpeg.add_paths()
+                static_ffmpeg_ffmpeg, static_ffmpeg_ffprobe = (
+                    get_or_fetch_platform_executables_else_raise()
+                )
+                ffmpeg = shutil.which("ffmpeg") or static_ffmpeg_ffmpeg
+                ffprobe = shutil.which("ffprobe") or static_ffmpeg_ffprobe
+                _STATIC_FFMPEG_DIR = os.path.dirname(ffmpeg)
+                _PATH_ENTRIES = os.environ.get("PATH", "").split(os.pathsep)
+                if (
+                    not _PATH_ENTRIES
+                    or os.path.normcase(os.path.abspath(_PATH_ENTRIES[0]))
+                    != os.path.normcase(os.path.abspath(_STATIC_FFMPEG_DIR))
+                ):
+                    os.environ["PATH"] = os.pathsep.join(
+                        [_STATIC_FFMPEG_DIR, os.environ.get("PATH", "")]
+                    )
+            except Exception as exc:
+                _STATIC_FFMPEG_PROVISION_FAILED = True
+                _LOG.warning(
+                    "[FFmpeg] Warning: Automated static FFmpeg provisioning "
+                    "failed: %s. Server proceeding with runtime fallbacks.",
+                    exc,
+                )
+                raise RuntimeError(
+                    "FFmpeg is unavailable; install system FFmpeg or retry audio "
+                    "processing after static FFmpeg provisioning is restored."
+                ) from exc
+
+        if ffmpeg and ffprobe and os.path.isfile(ffmpeg) and os.path.isfile(ffprobe):
+            _AUDIO_TOOL_PATHS = (ffmpeg, ffprobe)
+            return _AUDIO_TOOL_PATHS
         raise RuntimeError(
-            "Static FFmpeg is unavailable; reinstall the static-ffmpeg dependency."
+            "FFmpeg and FFprobe are unavailable; install them to process this audio format."
         )
-    return _STATIC_FFMPEG
+
+
+def ffmpeg_executable() -> str:
+    return _resolve_audio_tool_paths()[0]
 
 
 def ffprobe_executable() -> str:
-    if not os.path.isfile(_STATIC_FFPROBE):
-        raise RuntimeError(
-            "Static FFprobe is unavailable; reinstall the static-ffmpeg dependency."
-        )
-    return _STATIC_FFPROBE
+    return _resolve_audio_tool_paths()[1]
 
 
 def ffmpeg_available() -> bool:
-    return os.path.isfile(_STATIC_FFMPEG)
+    if _AUDIO_TOOL_PATHS is not None and os.path.isfile(_AUDIO_TOOL_PATHS[0]):
+        return True
+    return shutil.which("ffmpeg") is not None
 
 
 def ffprobe_available() -> bool:
-    return os.path.isfile(_STATIC_FFPROBE)
+    if _AUDIO_TOOL_PATHS is not None and os.path.isfile(_AUDIO_TOOL_PATHS[1]):
+        return True
+    return shutil.which("ffprobe") is not None
 
 
 def opus_codec_support() -> dict[str, bool]:
@@ -130,6 +181,33 @@ def probe_audio(audio: bytes, *, timeout: int = _FFMPEG_TIMEOUT_SECONDS) -> dict
     if not isinstance(audio, bytes) or not audio or len(audio) > _MAX_AUDIO_BYTES:
         raise ValueError("Audio payload is empty or exceeds the 25 MB limit.")
     timeout = _bounded_timeout(timeout)
+    if audio.startswith(b"RIFF") and audio[8:12] == b"WAVE":
+        try:
+            with wave.open(io.BytesIO(audio), "rb") as wav:
+                frame_count = wav.getnframes()
+                sample_rate = wav.getframerate()
+                if frame_count <= 0 or sample_rate <= 0:
+                    raise ValueError("Audio payload has an invalid duration.")
+                duration = frame_count / sample_rate
+                if duration > _MAX_DECODE_SECONDS:
+                    raise ValueError(
+                        "Audio payload exceeds the 120 second duration limit."
+                    )
+                return {
+                    "stream": {
+                        "codec_name": "pcm",
+                        "codec_type": "audio",
+                        "sample_rate": str(sample_rate),
+                        "channels": wav.getnchannels(),
+                    },
+                    "format": {
+                        "format_name": "wav",
+                        "duration": str(duration),
+                    },
+                    "duration": duration,
+                }
+        except (wave.Error, EOFError) as exc:
+            raise ValueError("Audio payload is not a valid WAV stream.") from exc
     temporary_path = None
     try:
         with tempfile.NamedTemporaryFile(
@@ -204,6 +282,53 @@ def decode_to_pcm_wav(
             raise ValueError("Telegram voice payload is not a valid Ogg container.")
 
     timeout = _bounded_timeout(timeout)
+    media_type = mime_type.lower().split(";", 1)[0].strip()
+    if audio.startswith(b"RIFF") and audio[8:12] == b"WAVE":
+        try:
+            with wave.open(io.BytesIO(audio), "rb") as wav:
+                frames = wav.getnframes()
+                if (
+                    frames <= 0
+                    or frames > 16000 * _MAX_DECODE_SECONDS
+                    or frames * wav.getnchannels() * wav.getsampwidth()
+                    > _MAX_PCM_WAV_BYTES
+                ):
+                    raise ValueError(
+                        "Audio payload exceeds the 120 second duration limit."
+                    )
+                if (
+                    wav.getnchannels() == 1
+                    and wav.getsampwidth() == 2
+                    and wav.getframerate() == 16000
+                ):
+                    return audio
+        except (wave.Error, EOFError) as exc:
+            raise ValueError("Audio payload is not a valid WAV stream.") from exc
+
+    if media_type in {"audio/pcm", "audio/l16", "audio/raw"}:
+        rate_match = re.search(
+            r"(?:rate|sample_rate)\s*=\s*(\d+)", mime_type, re.I
+        )
+        sample_rate = int(rate_match.group(1)) if rate_match else 0
+        if sample_rate != 16000:
+            raise ValueError(
+                "Native PCM fallback requires mono 16-bit audio at 16000 Hz."
+            )
+        if len(audio) % 2:
+            raise ValueError("Raw PCM payload has an incomplete 16-bit sample.")
+        frame_count = len(audio) // 2
+        if frame_count <= 0 or frame_count > 16000 * _MAX_DECODE_SECONDS:
+            raise ValueError(
+                "Audio payload exceeds the 120 second duration limit."
+            )
+        output = io.BytesIO()
+        with wave.open(output, "wb") as wav:
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(16000)
+            wav.writeframes(audio)
+        return output.getvalue()
+
     source = probe_audio(audio, timeout=timeout)
     if mime_type.lower().split(";", 1)[0].strip() in {"audio/ogg", "audio/opus"}:
         if (

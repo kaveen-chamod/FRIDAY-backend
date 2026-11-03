@@ -59,10 +59,14 @@ class SelfReflectionLedger:
         *,
         outcome_verifier: Callable[[str, bool, str], bool] | None = None,
     ) -> None:
-        self.path = Path(path) if path is not None else (
-            Path(__file__).resolve().parents[1]
-            / "memory"
-            / "reflection_ledger.jsonl"
+        state_root = Path(
+            os.environ.get("FRIDAY_STATE_DIR")
+            or Path(__file__).resolve().parents[1] / "memory"
+        ).expanduser().resolve()
+        self.path = (
+            Path(path).expanduser().resolve(strict=False)
+            if path is not None
+            else state_root / "reflection_ledger.jsonl"
         )
         self._lock = threading.RLock()
         self._outcome_verifier = outcome_verifier

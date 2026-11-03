@@ -25,8 +25,15 @@ class ForensicsError(OSError):
 
 class IncidentLedger:
     def __init__(self, path: str | Path | None = None) -> None:
-        root = Path(os.environ.get("FRIDAY_STATE_DIR") or Path(__file__).resolve().parents[2] / "memory")
-        self.path = Path(path) if path is not None else root / "defense_incidents.jsonl"
+        root = Path(
+            os.environ.get("FRIDAY_STATE_DIR")
+            or Path(__file__).resolve().parents[2] / "memory"
+        ).expanduser().resolve()
+        self.path = (
+            Path(path).expanduser().resolve(strict=False)
+            if path is not None
+            else root / "defense_incidents.jsonl"
+        )
         self._lock = threading.RLock()
 
     def append(self, incident: Mapping[str, Any]) -> dict[str, Any]:
